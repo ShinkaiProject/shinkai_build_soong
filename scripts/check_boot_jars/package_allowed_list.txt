@@ -259,6 +259,9 @@ org\.ifaa\.android\.manager.*
 # Lineage HALs
 vendor\.lineage\..*
 
+# Duck RKP HAL
+vendor\.evo\..*
+
 # Lineage adds
 lineageos\.platform
 org\.lineageos\.platform\.internal

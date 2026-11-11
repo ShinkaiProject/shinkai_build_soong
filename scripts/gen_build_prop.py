@@ -34,7 +34,7 @@ def get_build_variant(product_config):
     return "user"
 
 def get_build_flavor(product_config):
-  build_flavor = product_config["DeviceProduct"] + "-" + get_build_variant(product_config)
+  build_flavor = product_config["DeviceName"] + "-" + get_build_variant(product_config)
   if "address" in product_config.get("SanitizeDevice", []) and "_asan" not in build_flavor:
     build_flavor += "_asan"
   return build_flavor
@@ -43,11 +43,13 @@ def get_build_keys(product_config):
   default_cert = product_config.get("DefaultAppCertificate", "")
   if default_cert == "" or default_cert == os.path.join(TEST_KEY_DIR, "testKey"):
     return "test-keys"
-  if default_cert.startswith("vendor/lineage-priv/"):
-    return "release-keys"
-  if default_cert.startswith("vendor/private/"):
-    return "release-keys"
-  return "dev-keys"
+  return "release-keys"
+
+def limit_api_level(value):
+    try:
+        return min(int(value), 32)
+    except Exception:
+        return 32
 
 def override_config(config):
   if "PRODUCT_BUILD_PROP_OVERRIDES" in config:
@@ -92,13 +94,6 @@ def parse_args():
   args.config = json.load(args.product_config)
   config = args.config
 
-  if args.partition == "system":
-    config['ProductBrand'] = config['SystemBrand']
-    config['DeviceName'] = config['SystemDevice']
-    config['ProductManufacturer'] = config['SystemManufacturer']
-    config['ProductModel'] = config['SystemModel']
-    config['DeviceProduct'] = config['SystemName']
-
   config["BuildFlavor"] = get_build_flavor(config)
   config["BuildKeys"] = get_build_keys(config)
   config["BuildVariant"] = get_build_variant(config)
@@ -124,9 +119,10 @@ def parse_args():
   # build_desc is human readable strings that describe this build. This has the same info as the
   # build fingerprint.
   # e.g. "aosp_cf_x86_64_phone-userdebug VanillaIceCream MAIN eng.20240319.143939 test-keys"
-  config["BuildDesc"] = f"{config['DeviceProduct']}-{config['BuildVariant']} " \
+  config["BuildDesc"] = f"{config['DeviceName']}-{config['BuildVariant']} " \
                         f"{config['Platform_version_name']} {config['BuildId']} " \
                         f"{config['BuildNumber']} {config['BuildVersionTags']}"
+  config["BuildSystemDesc"] = config["BuildDesc"]
 
   config["PlatformPreviewSdkFingerprint"] = args.platform_preview_sdk_fingerprint_file.read().strip()
 
@@ -140,6 +136,21 @@ def parse_args():
     config["BuildNumber"] = config["DateUtc"]
 
   override_config(config)
+  # If only BuildFingerprint or BuildDesc was overridden, keep the system
+  # partition in sync unless the device overrode BuildSystem* explicitly.
+  overrides = config.get("PRODUCT_BUILD_PROP_OVERRIDES", [])
+  if any(v.startswith("BuildFingerprint=") for v in overrides) \
+          and not any(v.startswith("BuildSystemFingerprint=") for v in overrides):
+      config["BuildSystemFingerprint"] = config["BuildFingerprint"]
+  if any(v.startswith("BuildDesc=") for v in overrides) \
+          and not any(v.startswith("BuildSystemDesc=") for v in overrides):
+      config["BuildSystemDesc"] = config["BuildDesc"]
+  if args.partition == "system":
+    config['ProductBrand'] = config['SystemBrand']
+    config['DeviceName'] = config['SystemDevice']
+    config['ProductManufacturer'] = config['SystemManufacturer']
+    config['ProductModel'] = config['SystemModel']
+    config['DeviceProduct'] = config['SystemName']
 
   append_additional_system_props(args)
   append_additional_vendor_props(args)
@@ -161,7 +172,7 @@ def generate_common_build_props(args):
   print(f"ro.product.{partition}.device={config['DeviceName']}")
   print(f"ro.product.{partition}.manufacturer={config['ProductManufacturer']}")
   print(f"ro.product.{partition}.model={config['ProductModel']}")
-  print(f"ro.product.{partition}.name={config['DeviceProduct']}")
+  print(f"ro.product.{partition}.name={config['DeviceName']}")
 
   if partition != "system":
     if config["ProductModelForAttestation"]:
@@ -214,6 +225,7 @@ def generate_build_info(args):
 
   config = args.config
   build_flags = config["BuildFlags"]
+  partition = args.partition
 
   print(f"ro.build.fingerprint?={config['BuildFingerprint']}")
   print(f"ro.build.id?={config['BuildId']}")
@@ -274,7 +286,10 @@ def generate_build_info(args):
   print(f"ro.wifi.channels={' '.join(config['ProductDefaultWifiChannels'])}")
 
   print(f"# Do not try to parse description or thumbprint")
-  print(f"ro.build.description?={config['BuildDesc']}")
+  if partition == "system":
+    print(f"ro.build.description?={config['BuildSystemDesc']}")
+  else:
+    print(f"ro.build.description?={config['BuildDesc']}")
   if "BuildThumbprint" in config:
     print(f"ro.build.thumbprint={config['BuildThumbprint']}")
 
@@ -365,12 +380,13 @@ def append_additional_system_props(args):
   # mount system_other partition.
   props.append("ro.postinstall.fstab.prefix=/system")
 
-  enable_target_debugging = True
-  enable_dalvik_lock_contention_logging = True
+  enable_target_debugging = False
+  enable_dalvik_lock_contention_logging = False
   if config["BuildVariant"] == "user" or config["BuildVariant"] == "userdebug":
     # Target is secure in user builds.
     props.append("ro.secure=1")
-    props.append("security.perf_harden=1")
+    # at least one app (Revolut) refuses to work with yellow verifiedbootstate
+    props.append("ro.appcompat_override.ro.boot.verifiedbootstate=green")
 
     if config["BuildVariant"] == "user":
       # Disable debugging in plain user builds.
@@ -387,7 +403,7 @@ def append_additional_system_props(args):
     props.append("ro.allow.mock.location=0")
   else:
     # Turn on checkjni for non-user builds.
-    props.append("ro.kernel.android.checkjni=1")
+    props.append("ro.kernel.android.checkjni=0")
     # Set device insecure for non-user builds.
     props.append("ro.secure=0")
     # Allow mock locations by default for non user builds
@@ -469,7 +485,7 @@ def append_additional_vendor_props(args):
     props.append(f"ro.boot.dynamic_partitions_retrofit={'true' if config['RetrofitDynamicPartitions'] else 'false'}")
 
   if config["ShippingApiLevel"]:
-    props.append(f"ro.product.first_api_level={config['ShippingApiLevel']}")
+    props.append(f"ro.product.first_api_level={limit_api_level(config['ShippingApiLevel'])}")
 
   if config["BuildVariant"] != "user":
     if "BuildDebugfsRestrictionsEnabled" in config:
@@ -479,7 +495,7 @@ def append_additional_vendor_props(args):
   # This must not be defined for the non-GRF devices.
   # The values of the GRF properties will be verified by post_process_props.py
   if config["BoardShippingApiLevel"]:
-    props.append(f"ro.board.first_api_level={config['BoardShippingApiLevel']}")
+    props.append(f"ro.board.first_api_level={limit_api_level(config['BoardShippingApiLevel'])}")
 
   # Build system set BOARD_API_LEVEL to show the api level of the vendor API surface.
   # This must not be altered outside of build system.
